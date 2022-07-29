@@ -1,4 +1,8 @@
+#include <stdlib.h>
+#include <stdio.h>
+
 #define CASH_RL_BUFSIZE 1024
+
 char *cash_read_line(void) {
   int bufsize = CASH_RL_BUFSIZE;
   int position = 0;
@@ -38,6 +42,7 @@ char *cash_read_line(void) {
 
 #define CASH_TOK_BUFSIZE 64
 #define CASH_TOK_DELIM " \t\r\n\a"
+
 char **cash_split_line(char *line)
 {
   int bufsize = CASH_TOK_BUFSIZE, position = 0;
@@ -84,6 +89,32 @@ void cash_loop() {
         free(line);
         free(args);
     } while (status);
+}
+
+
+int cash_launch(char **args)
+{
+  pid_t pid, wpid;
+  int status;
+
+  pid = fork();
+  if (pid == 0) {
+    // Child process
+    if (execvp(args[0], args) == -1) {
+      perror("cash");
+    }
+    exit(EXIT_FAILURE);
+  } else if (pid < 0) {
+    // Error forking
+    perror("cash");
+  } else {
+    // Parent process
+    do {
+      wpid = waitpid(pid, &status, WUNTRACED);
+    } while (!WIFEXITED(status) && !WIFSIGNALED(status));
+  }
+
+  return 1;
 }
 
 int main(int argc, char **argv)

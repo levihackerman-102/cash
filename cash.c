@@ -141,23 +141,6 @@ int cash_exit(char **args)
 }
 
 
-void cash_loop() {
-    char *line;
-    char **args;
-    int status;
-
-    do {
-        printf("> ");
-        line = cash_read_line();
-        args = cash_split_line(line);
-        status = cash_execute(args);
-
-        free(line);
-        free(args);
-    } while (status);
-}
-
-
 int cash_launch(char **args)
 {
   pid_t pid, wpid;
@@ -169,7 +152,7 @@ int cash_launch(char **args)
     if (execvp(args[0], args) == -1) {
       perror("cash");
     }
-    exit(EXIT_FAILURE);
+    exit(EXIT_FAILURE); // if you reach here, it means the child process did not execute correctly
   } else if (pid < 0) {
     // Error forking
     perror("cash");
@@ -200,6 +183,23 @@ int cash_execute(char **args)
   }
 
   return cash_launch(args);
+}
+
+
+void cash_loop() {
+    char *line;
+    char **args;
+    int status;
+
+    do {
+        printf("$_$ ");
+        line = cash_read_line();
+        args = cash_split_line(line);
+        status = cash_execute(args);
+
+        free(line);
+        free(args);
+    } while (status);
 }
 
 

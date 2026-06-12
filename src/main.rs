@@ -26,34 +26,58 @@ struct SavedFds {
     stderr: Option<libc::c_int>,
 }
 
-fn parse_command(line: &str) -> Result<ParsedCommand, String> {
-    let mut args = Vec::new();
-    let mut redirections = Redirections::default();
+fn parse_pipeline(line: &str) -> Result<Vec<ParsedCommand>, String> {
+    let mut commands = Vec::new();
+    let mut current = ParsedCommand {
+        args: Vec::new(),
+        redirections: Redirections::default(),
+    };
+
     let mut tokens = line.split_whitespace().peekable();
 
     while let Some(token) = tokens.next() {
         match token {
+            "|" => {
+                if current.args.is_empty() {
+                    return Err("missing command before |".to_string());
+                }
+
+                commands.push(current);
+                current = ParsedCommand {
+                    args: Vec::new(),
+                    redirections: Redirections::default(),
+                };
+            }
             "<" => {
                 let file = tokens.next().ok_or_else(|| "missing file after <".to_string())?;
-                redirections.stdin = Some(file.to_string());
+                current.redirections.stdin = Some(file.to_string());
             }
             ">" => {
                 let file = tokens.next().ok_or_else(|| "missing file after >".to_string())?;
-                redirections.stdout = Some((file.to_string(), false));
+                current.redirections.stdout = Some((file.to_string(), false));
             }
             ">>" => {
                 let file = tokens.next().ok_or_else(|| "missing file after >>".to_string())?;
-                redirections.stdout = Some((file.to_string(), true));
+                current.redirections.stdout = Some((file.to_string(), true));
             }
             "2>" => {
                 let file = tokens.next().ok_or_else(|| "missing file after 2>".to_string())?;
-                redirections.stderr = Some(file.to_string());
+                current.redirections.stderr = Some(file.to_string());
             }
-            _ => args.push(token.to_string()),
+            _ => current.args.push(token.to_string()),
         }
     }
 
-    Ok(ParsedCommand { args, redirections })
+    if current.args.is_empty() {
+        if commands.is_empty() {
+            return Err("missing command".to_string());
+        }
+
+        return Err("missing command after |".to_string());
+    }
+
+    commands.push(current);
+    Ok(commands)
 }
 
 fn cstring_from_str(value: &str, context: &str) -> Result<CString, String> {
@@ -169,6 +193,15 @@ fn restore_redirections(saved: SavedFds) {
     }
 }
 
+fn close_pipe_fds(pipes: &[(libc::c_int, libc::c_int)]) {
+    for (read_end, write_end) in pipes {
+        unsafe {
+            libc::close(*read_end);
+            libc::close(*write_end);
+        }
+    }
+}
+
 fn run_with_redirections<F>(redirections: &Redirections, action: F) -> Result<BuiltinResult, String>
 where
     F: FnOnce() -> BuiltinResult,
@@ -177,6 +210,108 @@ where
     let result = action();
     restore_redirections(saved);
     Ok(result)
+}
+
+fn is_builtin(command: &str) -> bool {
+    matches!(command, "exit" | "cd" | "export" | "unset")
+}
+
+fn run_pipeline_command(command: &ParsedCommand, pipes: &[(libc::c_int, libc::c_int)], index: usize) -> ! {
+    unsafe {
+        if index > 0 {
+            let (read_end, _) = pipes[index - 1];
+            if libc::dup2(read_end, libc::STDIN_FILENO) < 0 {
+                eprintln!("dup2 failed: {}", std::io::Error::last_os_error());
+                libc::_exit(1);
+            }
+        }
+
+        if index < pipes.len() {
+            let (_, write_end) = pipes[index];
+            if libc::dup2(write_end, libc::STDOUT_FILENO) < 0 {
+                eprintln!("dup2 failed: {}", std::io::Error::last_os_error());
+                libc::_exit(1);
+            }
+        }
+
+        close_pipe_fds(pipes);
+
+        if let Err(error) = apply_redirections(&command.redirections) {
+            eprintln!("{error}");
+            libc::_exit(1);
+        }
+    }
+
+    if is_builtin(command.args[0].as_str()) {
+        let builtin_args: Vec<&str> = command.args.iter().map(|arg| arg.as_str()).collect();
+        let exit_code = match run_builtin(&builtin_args) {
+            BuiltinResult::Exit | BuiltinResult::Handled => 0,
+            BuiltinResult::NotBuiltin => 127,
+        };
+        unsafe {
+            libc::_exit(exit_code);
+        }
+    }
+
+    let args: Vec<CString> = command
+        .args
+        .iter()
+        .map(|arg| CString::new(arg.as_bytes()).expect("argument contains NUL byte"))
+        .collect();
+
+    let mut argv: Vec<*const libc::c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
+    argv.push(std::ptr::null());
+
+    unsafe {
+        libc::execvp(args[0].as_ptr(), argv.as_ptr());
+        eprintln!("{}: command not found", command.args[0]);
+        libc::_exit(1);
+    }
+}
+
+fn run_pipeline(commands: &[ParsedCommand]) -> Result<(), String> {
+    let mut pipes = Vec::new();
+    for _ in 0..commands.len().saturating_sub(1) {
+        let mut fds = [0; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+            close_pipe_fds(&pipes);
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        pipes.push((fds[0], fds[1]));
+    }
+
+    let mut children = Vec::new();
+
+    for (index, command) in commands.iter().enumerate() {
+        let pid = unsafe { libc::fork() };
+
+        if pid < 0 {
+            close_pipe_fds(&pipes);
+            for child in &children {
+                unsafe {
+                    libc::waitpid(*child, std::ptr::null_mut(), 0);
+                }
+            }
+            return Err("fork failed".to_string());
+        }
+
+        if pid == 0 {
+            run_pipeline_command(command, &pipes, index);
+        }
+
+        children.push(pid);
+    }
+
+    close_pipe_fds(&pipes);
+
+    for child in children {
+        let mut status: libc::c_int = 0;
+        if unsafe { libc::waitpid(child, &mut status, 0) } < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+
+    Ok(())
 }
 
 fn run_builtin(args: &[&str]) -> BuiltinResult {
@@ -303,69 +438,81 @@ fn main() {
             continue;
         }
 
-        let parsed = match parse_command(line) {
-            Ok(parsed) => parsed,
+        let pipeline = match parse_pipeline(line) {
+            Ok(pipeline) => pipeline,
             Err(error) => {
                 eprintln!("{error}");
                 continue;
             }
         };
 
-        if parsed.args.is_empty() {
+        if pipeline.is_empty() {
             continue;
         }
 
-        match parsed.args[0].as_str() {
-            "exit" => break,
-            "cd" | "export" | "unset" => {
-                let builtin_args: Vec<&str> = parsed.args.iter().map(|arg| arg.as_str()).collect();
-                match run_with_redirections(&parsed.redirections, || run_builtin(&builtin_args)) {
-                    Ok(BuiltinResult::Exit) => break,
-                    Ok(BuiltinResult::Handled) => continue,
-                    Ok(BuiltinResult::NotBuiltin) => continue,
-                    Err(error) => {
-                        eprintln!("{error}");
-                        continue;
+        if pipeline.len() == 1 {
+            let parsed = &pipeline[0];
+
+            match parsed.args[0].as_str() {
+                "exit" => break,
+                "cd" | "export" | "unset" => {
+                    let builtin_args: Vec<&str> = parsed.args.iter().map(|arg| arg.as_str()).collect();
+                    match run_with_redirections(&parsed.redirections, || run_builtin(&builtin_args)) {
+                        Ok(BuiltinResult::Exit) => break,
+                        Ok(BuiltinResult::Handled) => continue,
+                        Ok(BuiltinResult::NotBuiltin) => continue,
+                        Err(error) => {
+                            eprintln!("{error}");
+                            continue;
+                        }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
 
-        let args: Vec<CString> = parsed
-            .args
-            .iter()
-            .map(|arg| CString::new(arg.as_bytes()).expect("argument contains NUL byte"))
-            .collect();
+        if pipeline.len() == 1 {
+            let parsed = &pipeline[0];
+            let args: Vec<CString> = parsed
+                .args
+                .iter()
+                .map(|arg| CString::new(arg.as_bytes()).expect("argument contains NUL byte"))
+                .collect();
 
-        let mut argv: Vec<*const libc::c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
-        argv.push(std::ptr::null());
+            let mut argv: Vec<*const libc::c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
+            argv.push(std::ptr::null());
 
-        let pid = unsafe { libc::fork() };
+            let pid = unsafe { libc::fork() };
 
-        if pid < 0 {
-            eprintln!("fork failed");
-            continue;
-        }
+            if pid < 0 {
+                eprintln!("fork failed");
+                continue;
+            }
 
-        if pid == 0 {
-            unsafe {
-                if let Err(error) = apply_redirections(&parsed.redirections) {
-                    eprintln!("{error}");
+            if pid == 0 {
+                unsafe {
+                    if let Err(error) = apply_redirections(&parsed.redirections) {
+                        eprintln!("{error}");
+                        libc::_exit(1);
+                    }
+                    libc::execvp(args[0].as_ptr(), argv.as_ptr());
+                    eprintln!("{}: command not found", parsed.args[0]);
                     libc::_exit(1);
                 }
-                libc::execvp(args[0].as_ptr(), argv.as_ptr());
-                eprintln!("{}: command not found", parsed.args[0]);
-                libc::_exit(1);
             }
-        }
 
-        let mut status: libc::c_int = 0;
-        if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
-            eprintln!("waitpid failed");
+            let mut status: libc::c_int = 0;
+            if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+                eprintln!("waitpid failed");
+                continue;
+            }
+
+            let _exit_status = status;
             continue;
         }
 
-        let _exit_status = status;
+        if let Err(error) = run_pipeline(&pipeline) {
+            eprintln!("{error}");
+        }
     }
 }

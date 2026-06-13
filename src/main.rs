@@ -89,6 +89,11 @@ extern "C" fn sigint_handler(_: libc::c_int) {
 
 fn install_signal_handlers() -> Result<(), String> {
     unsafe {
+        // Ignore terminal background I/O signals so the shell isn't stopped
+        // when it changes terminal foreground process groups.
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+
         let mut sigchld_action: libc::sigaction = std::mem::zeroed();
         sigchld_action.sa_sigaction = sigchld_handler as usize;
         sigchld_action.sa_flags = libc::SA_RESTART | libc::SA_NOCLDSTOP;
@@ -165,6 +170,36 @@ fn parse_pipeline(line: &str) -> Result<Vec<ParsedCommand>, String> {
 
 fn cstring_from_str(value: &str, context: &str) -> Result<CString, String> {
     CString::new(value.as_bytes()).map_err(|_| format!("{context} contains NUL byte"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_simple_command() {
+        let pipeline = parse_pipeline("echo hello").expect("parse");
+        assert_eq!(pipeline.len(), 1);
+        let cmd = &pipeline[0];
+        assert_eq!(cmd.args, vec!["echo".to_string(), "hello".to_string()]);
+    }
+
+    #[test]
+    fn parse_pipeline_and_redirections() {
+        let pipeline = parse_pipeline("ls | grep foo > out.txt 2> err.txt").expect("parse");
+        assert_eq!(pipeline.len(), 2);
+        assert_eq!(pipeline[0].args[0], "ls");
+        assert_eq!(pipeline[1].args[0], "grep");
+        assert_eq!(pipeline[1].redirections.stdout.as_ref().map(|(p,_)| p.clone()), Some("out.txt".to_string()));
+        assert_eq!(pipeline[1].redirections.stderr.as_ref().map(|p| p.clone()), Some("err.txt".to_string()));
+    }
+
+    #[test]
+    fn cstring_from_str_rejects_nul() {
+        let s = "foo\0bar";
+        let res = cstring_from_str(s, "test");
+        assert!(res.is_err());
+    }
 }
 
 fn open_for_redirection(path: &str, flags: libc::c_int) -> Result<libc::c_int, String> {
@@ -403,6 +438,11 @@ fn run_single_external(parsed: &ParsedCommand, background: bool) -> Result<(), S
             let child_pid = libc::getpid();
             libc::setpgid(0, child_pid);
 
+            // Reset signal handlers to defaults in the child so programs like
+            // `vim` receive SIGINT/SIGQUIT normally.
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+
             if let Err(error) = apply_redirections(&parsed.redirections) {
                 eprintln!("{error}");
                 libc::_exit(1);
@@ -422,7 +462,21 @@ fn run_single_external(parsed: &ParsedCommand, background: bool) -> Result<(), S
         return Ok(());
     }
 
-    wait_for_foreground_job(&[pid], pid)
+    // Give the child process group control of the terminal so interactive
+    // programs (vim, nano, etc.) can read from / write to the tty.
+    let shell_pgid = unsafe { libc::getpgrp() };
+    unsafe {
+        libc::tcsetpgrp(libc::STDIN_FILENO, pid);
+    }
+
+    let res = wait_for_foreground_job(&[pid], pid);
+
+    // Restore terminal control to the shell.
+    unsafe {
+        libc::tcsetpgrp(libc::STDIN_FILENO, shell_pgid);
+    }
+
+    res
 }
 
 fn run_pipeline(commands: &[ParsedCommand], background: bool) -> Result<(), String> {
@@ -458,6 +512,11 @@ fn run_pipeline(commands: &[ParsedCommand], background: bool) -> Result<(), Stri
                     pgid = libc::getpid();
                 }
                 libc::setpgid(0, pgid);
+
+                // In child, reset signal dispositions to defaults so interactive
+                // programs behave normally.
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::signal(libc::SIGQUIT, libc::SIG_DFL);
             }
             run_pipeline_command(command, &pipes, index);
         }
@@ -479,7 +538,20 @@ fn run_pipeline(commands: &[ParsedCommand], background: bool) -> Result<(), Stri
         return Ok(());
     }
 
-    wait_for_foreground_job(&children, pgid)
+    // Give the pipeline control of the terminal so interactive stages work.
+    let shell_pgid = unsafe { libc::getpgrp() };
+    unsafe {
+        libc::tcsetpgrp(libc::STDIN_FILENO, pgid);
+    }
+
+    let res = wait_for_foreground_job(&children, pgid);
+
+    // Restore control to the shell.
+    unsafe {
+        libc::tcsetpgrp(libc::STDIN_FILENO, shell_pgid);
+    }
+
+    res
 }
 
 fn run_builtin(args: &[&str]) -> BuiltinResult {

@@ -1,6 +1,9 @@
 use std::env;
 use std::ffi::CString;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicI32, Ordering};
+
+static FOREGROUND_PGID: AtomicI32 = AtomicI32::new(0);
 
 enum BuiltinResult {
     NotBuiltin,
@@ -24,6 +27,86 @@ struct SavedFds {
     stdin: Option<libc::c_int>,
     stdout: Option<libc::c_int>,
     stderr: Option<libc::c_int>,
+}
+
+extern "C" fn sigchld_handler(_: libc::c_int) {
+    let saved_errno = unsafe { *libc::__errno_location() };
+
+    loop {
+        let mut status: libc::c_int = 0;
+        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+
+        if pid > 0 {
+            // Successfully reaped a child; continue draining any others.
+            continue;
+        }
+
+        if pid == 0 {
+            // No more exited children at the moment.
+            break;
+        }
+
+        // pid < 0 => error; inspect errno to decide what to do.
+        let err = unsafe { *libc::__errno_location() };
+        if err == libc::EINTR {
+            // Interrupted by a signal, retry the wait.
+            continue;
+        }
+
+        if err == libc::ECHILD {
+            // No child processes exist.
+            break;
+        }
+
+        // Unexpected error; stop to avoid unsafe behavior in handler.
+        break;
+    }
+
+    unsafe {
+        *libc::__errno_location() = saved_errno;
+    }
+}
+
+extern "C" fn sigint_handler(_: libc::c_int) {
+    let pgid = FOREGROUND_PGID.load(Ordering::SeqCst);
+
+    if pgid > 0 {
+        unsafe {
+            libc::kill(-pgid, libc::SIGINT);
+        }
+        return;
+    }
+
+    let newline = b"\n";
+    unsafe {
+        libc::write(
+            libc::STDOUT_FILENO,
+            newline.as_ptr() as *const libc::c_void,
+            newline.len(),
+        );
+    }
+}
+
+fn install_signal_handlers() -> Result<(), String> {
+    unsafe {
+        let mut sigchld_action: libc::sigaction = std::mem::zeroed();
+        sigchld_action.sa_sigaction = sigchld_handler as usize;
+        sigchld_action.sa_flags = libc::SA_RESTART | libc::SA_NOCLDSTOP;
+        libc::sigemptyset(&mut sigchld_action.sa_mask);
+        if libc::sigaction(libc::SIGCHLD, &sigchld_action, std::ptr::null_mut()) < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+
+        let mut sigint_action: libc::sigaction = std::mem::zeroed();
+        sigint_action.sa_sigaction = sigint_handler as usize;
+        sigint_action.sa_flags = 0;
+        libc::sigemptyset(&mut sigint_action.sa_mask);
+        if libc::sigaction(libc::SIGINT, &sigint_action, std::ptr::null_mut()) < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_pipeline(line: &str) -> Result<Vec<ParsedCommand>, String> {
@@ -269,7 +352,80 @@ fn run_pipeline_command(command: &ParsedCommand, pipes: &[(libc::c_int, libc::c_
     }
 }
 
-fn run_pipeline(commands: &[ParsedCommand]) -> Result<(), String> {
+fn wait_for_foreground_job(children: &[libc::pid_t], pgid: libc::pid_t) -> Result<(), String> {
+    FOREGROUND_PGID.store(pgid, Ordering::SeqCst);
+
+    for child in children {
+        loop {
+            let mut status: libc::c_int = 0;
+            let result = unsafe { libc::waitpid(*child, &mut status, 0) };
+
+            if result == *child {
+                break;
+            }
+
+            if result < 0 {
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(code) if code == libc::EINTR => continue,
+                    Some(code) if code == libc::ECHILD => break,
+                    _ => {
+                        FOREGROUND_PGID.store(0, Ordering::SeqCst);
+                        return Err(error.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    FOREGROUND_PGID.store(0, Ordering::SeqCst);
+    Ok(())
+}
+
+fn run_single_external(parsed: &ParsedCommand, background: bool) -> Result<(), String> {
+    let args: Vec<CString> = parsed
+        .args
+        .iter()
+        .map(|arg| CString::new(arg.as_bytes()).expect("argument contains NUL byte"))
+        .collect();
+
+    let mut argv: Vec<*const libc::c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
+    argv.push(std::ptr::null());
+
+    let pid = unsafe { libc::fork() };
+
+    if pid < 0 {
+        return Err("fork failed".to_string());
+    }
+
+    if pid == 0 {
+        unsafe {
+            let child_pid = libc::getpid();
+            libc::setpgid(0, child_pid);
+
+            if let Err(error) = apply_redirections(&parsed.redirections) {
+                eprintln!("{error}");
+                libc::_exit(1);
+            }
+            libc::execvp(args[0].as_ptr(), argv.as_ptr());
+            eprintln!("{}: command not found", parsed.args[0]);
+            libc::_exit(1);
+        }
+    }
+
+    unsafe {
+        libc::setpgid(pid, pid);
+    }
+
+    if background {
+        println!("[{pid}] running in background");
+        return Ok(());
+    }
+
+    wait_for_foreground_job(&[pid], pid)
+}
+
+fn run_pipeline(commands: &[ParsedCommand], background: bool) -> Result<(), String> {
     let mut pipes = Vec::new();
     for _ in 0..commands.len().saturating_sub(1) {
         let mut fds = [0; 2];
@@ -281,6 +437,7 @@ fn run_pipeline(commands: &[ParsedCommand]) -> Result<(), String> {
     }
 
     let mut children = Vec::new();
+    let mut pgid: libc::pid_t = 0;
 
     for (index, command) in commands.iter().enumerate() {
         let pid = unsafe { libc::fork() };
@@ -296,7 +453,20 @@ fn run_pipeline(commands: &[ParsedCommand]) -> Result<(), String> {
         }
 
         if pid == 0 {
+            unsafe {
+                if pgid == 0 {
+                    pgid = libc::getpid();
+                }
+                libc::setpgid(0, pgid);
+            }
             run_pipeline_command(command, &pipes, index);
+        }
+
+        if pgid == 0 {
+            pgid = pid;
+        }
+        unsafe {
+            libc::setpgid(pid, pgid);
         }
 
         children.push(pid);
@@ -304,14 +474,12 @@ fn run_pipeline(commands: &[ParsedCommand]) -> Result<(), String> {
 
     close_pipe_fds(&pipes);
 
-    for child in children {
-        let mut status: libc::c_int = 0;
-        if unsafe { libc::waitpid(child, &mut status, 0) } < 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
+    if background {
+        println!("[{pgid}] running in background");
+        return Ok(());
     }
 
-    Ok(())
+    wait_for_foreground_job(&children, pgid)
 }
 
 fn run_builtin(args: &[&str]) -> BuiltinResult {
@@ -416,6 +584,11 @@ fn run_builtin(args: &[&str]) -> BuiltinResult {
 }
 
 fn main() {
+    if let Err(error) = install_signal_handlers() {
+        eprintln!("failed to install signal handlers: {error}");
+        return;
+    }
+
     let stdin = io::stdin();
     let mut input = String::new();
 
@@ -428,6 +601,9 @@ fn main() {
             Ok(0) => break,
             Ok(_) => {}
             Err(error) => {
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
                 eprintln!("failed to read line: {error}");
                 continue;
             }
@@ -438,7 +614,18 @@ fn main() {
             continue;
         }
 
-        let pipeline = match parse_pipeline(line) {
+        let mut tokens: Vec<&str> = line.split_whitespace().collect();
+        let background = matches!(tokens.last(), Some(&"&"));
+        if background {
+            tokens.pop();
+        }
+
+        let command_line = tokens.join(" ");
+        if command_line.is_empty() {
+            continue;
+        }
+
+        let pipeline = match parse_pipeline(command_line.as_str()) {
             Ok(pipeline) => pipeline,
             Err(error) => {
                 eprintln!("{error}");
@@ -473,45 +660,13 @@ fn main() {
 
         if pipeline.len() == 1 {
             let parsed = &pipeline[0];
-            let args: Vec<CString> = parsed
-                .args
-                .iter()
-                .map(|arg| CString::new(arg.as_bytes()).expect("argument contains NUL byte"))
-                .collect();
-
-            let mut argv: Vec<*const libc::c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
-            argv.push(std::ptr::null());
-
-            let pid = unsafe { libc::fork() };
-
-            if pid < 0 {
-                eprintln!("fork failed");
-                continue;
+            if let Err(error) = run_single_external(parsed, background) {
+                eprintln!("{error}");
             }
-
-            if pid == 0 {
-                unsafe {
-                    if let Err(error) = apply_redirections(&parsed.redirections) {
-                        eprintln!("{error}");
-                        libc::_exit(1);
-                    }
-                    libc::execvp(args[0].as_ptr(), argv.as_ptr());
-                    eprintln!("{}: command not found", parsed.args[0]);
-                    libc::_exit(1);
-                }
-            }
-
-            let mut status: libc::c_int = 0;
-            if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
-                eprintln!("waitpid failed");
-                continue;
-            }
-
-            let _exit_status = status;
             continue;
         }
 
-        if let Err(error) = run_pipeline(&pipeline) {
+        if let Err(error) = run_pipeline(&pipeline, background) {
             eprintln!("{error}");
         }
     }
